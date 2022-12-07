@@ -1,3 +1,12 @@
 {
-    "port": "8080"
+    "title": "HU OSS",
+    "port": "8080",
+    "ssl": false,
+    "ws": true,
+    "prefix": "/service/",
+    "codec": "xor",
+    "blacklist": [
+        "accounts.google.com",
+        "dcounter.space"
+    ]
 }

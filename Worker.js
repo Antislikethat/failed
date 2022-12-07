@@ -1,6 +1,6 @@
 "use strict";
 /*
- Copyright (C) 2012-2019 Grant Galitz
+ Copyright (C) 2012-2016 Grant Galitz
 
  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
@@ -8,293 +8,580 @@
 
  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-importScripts("../includes/TypedArrayShim.js");
-importScripts("Cartridge.js");
-importScripts("DMA.js");
-importScripts("Emulator.js");
-importScripts("Graphics.js");
-importScripts("RunLoop.js");
-importScripts("Memory.js");
-importScripts("IRQ.js");
-importScripts("JoyPad.js");
-importScripts("Serial.js");
-importScripts("Sound.js");
-importScripts("Timer.js");
-importScripts("Wait.js");
-importScripts("CPU.js");
-importScripts("Saves.js");
-importScripts("sound/FIFO.js");
-importScripts("sound/Channel1.js");
-importScripts("sound/Channel2.js");
-importScripts("sound/Channel3.js");
-importScripts("sound/Channel4.js");
-importScripts("CPU/ARM.js");
-importScripts("CPU/THUMB.js");
-importScripts("CPU/CPSR.js");
-importScripts("graphics/RendererProxy.js");
-importScripts("graphics/RendererShim.js");
-importScripts("graphics/Renderer.js");
-importScripts("graphics/BGTEXT.js");
-importScripts("graphics/BG2FrameBuffer.js");
-importScripts("graphics/BGMatrix.js");
-importScripts("graphics/AffineBG.js");
-importScripts("graphics/ColorEffects.js");
-importScripts("graphics/Mosaic.js");
-importScripts("graphics/OBJ.js");
-importScripts("graphics/OBJWindow.js");
-importScripts("graphics/Window.js");
-importScripts("graphics/Compositor.js");
-importScripts("memory/DMA0.js");
-importScripts("memory/DMA1.js");
-importScripts("memory/DMA2.js");
-importScripts("memory/DMA3.js");
-importScripts("cartridge/SaveDeterminer.js");
-importScripts("cartridge/SRAM.js");
-importScripts("cartridge/FLASH.js");
-importScripts("cartridge/EEPROM.js");
-importScripts("cartridge/GPIO.js");
-var Iodine = new GameBoyAdvanceEmulator();
-//Save callbacks waiting to be satisfied:
-var saveImportPool = [];
-//Graphics Buffers:
-var gfxBuffers = [getSharedUint8Array(160 * 240 * 3),
-  getSharedUint8Array(160 * 240 * 3)];
-var gfxCounters = getSharedInt32Array(3);
-//Audio Buffers:
-var audioBuffer = null;
-var audioCounters = null;
-var audioBufferSize = 0;
-var audioBufferSizeMask = 0;
-var audioSamplesRemaining = getSharedInt32Array(1);
-//Time Stamp tracking:
-var timestamp = getSharedUint32Array(1);
-//Interval Timer handle:
-var timerHandle = null;
-var timerRate = 0;
-//Pass the shared array buffers:
-try {
-    postMessage({messageID:0, gfxBuffer1:gfxBuffers[0], gfxBuffer2:gfxBuffers[1], gfxCounters:gfxCounters, audioSamplesRemaining:audioSamplesRemaining, timestamp:timestamp}, [gfxBuffers[0].buffer, gfxBuffers[1].buffer, gfxCounters.buffer, audioSamplesRemaining.buffer, timestamp.buffer]);
-}
-catch (e) {
-    postMessage({messageID:0, gfxBuffer1:gfxBuffers[0], gfxBuffer2:gfxBuffers[1], gfxCounters:gfxCounters, audioSamplesRemaining:audioSamplesRemaining, timestamp:timestamp});
-}
-//Event decoding:
+importScripts("../../includes/TypedArrayShim.js");
+importScripts("Renderer.js");
+importScripts("BGTEXT.js");
+importScripts("BG2FrameBuffer.js");
+importScripts("BGMatrix.js");
+importScripts("AffineBG.js");
+importScripts("ColorEffects.js");
+importScripts("Mosaic.js");
+importScripts("OBJ.js");
+importScripts("OBJWindow.js");
+importScripts("Window.js");
+importScripts("Compositor.js");
+var renderer = null;
+var gfxBuffers = null;
+var gfxCounters = null;
+var gfxCommandBuffer = null;
+var gfxCommandCounters = null;
+var gfxCommandBufferMask = 1;
+var gfxLineCounter = null;
+var gfxLinesCPU = 0;
+var gfxLinesGPU = 0;
 self.onmessage = function (event) {
     var data = event.data;
     switch (data.messageID | 0) {
         case 0:
-            Iodine.play();
+            assignStaticBuffers(data.gfxBuffers, data.gfxCounters, data.gfxLineCounter);
             break;
         case 1:
-            Iodine.pause();
+            initializeRenderer(!!data.skippingBIOS);
+            break;
+        default:
+            assignDynamicBuffers(data.gfxCommandBuffer, data.gfxCommandCounters);
+            waitForVSync();
+    }
+}
+function copyBuffer(swizzledFrame) {
+    //Push a frame of graphics to the blitter handle:
+    //Load the counter values:
+    var start = Atomics.load(gfxCounters, 0) | 0;       //Written by the other thread.
+    var end = gfxCounters[1] | 0;                       //Written by this thread.
+    //Check if buffer is full:
+    if ((end | 0) == (((start | 0) + 2) | 0)) {
+        //Skip copying a frame out:
+        return;
+    }
+    //Copy samples into the ring buffer:
+    //Hardcoded for 2 buffers for a triple buffer effect:
+    gfxBuffers[end & 0x1].set(swizzledFrame);
+    //Increment the ending position counter by 1:
+    //Atomic to commit the counter to memory:
+    Atomics.store(gfxCounters, 1, ((end | 0) + 1) | 0);
+}
+function waitForVSync() {
+    //Only breaks if the buffer gets resized:
+    while ((Atomics.load(gfxCommandCounters, 2) | 0) == 0) {
+        //Process the current buffer:
+        processCommands();
+        //Main thread calls wake to unblock us here:
+        Atomics.wait(gfxCounters, 2, 0);
+    }
+    //Empty old buffer before getting a new buffer to refer to:
+    processCommands();
+}
+function initializeRenderer(skippingBIOS) {
+    skippingBIOS = !!skippingBIOS;
+    renderer = new GameBoyAdvanceGraphicsRendererOffthread(!!skippingBIOS);
+}
+function assignStaticBuffers(gfxb, gfxc, cmdl) {
+    gfxBuffers = gfxb;
+    gfxCounters = gfxc;
+    gfxLineCounter = cmdl;
+}
+function assignDynamicBuffers(cmdb, cmdc) {
+    gfxCommandBuffer = cmdb;
+    gfxCommandCounters = cmdc;
+    var gfxCommandBufferLength = gfxCommandBuffer.length | 0;
+    gfxCommandBufferMask = ((gfxCommandBufferLength | 0) - 1) | 0;
+}
+function processCommands() {
+    //Load the counter values:
+    var start = gfxCommandCounters[0] | 0;              //Written by this thread.
+    var end = Atomics.load(gfxCommandCounters, 1) | 0;  //Written by the other thread.
+    gfxLinesCPU = Atomics.load(gfxLineCounter, 0) | 0;  //Keep atomic; IonMonkey thinks this is dead code if it's removed.
+    //Don't process if nothing to process:
+    if ((end | 0) == (start | 0)) {
+        //Buffer is empty:
+        return;
+    }
+    //Dispatch commands:
+    var startCorrected = start & gfxCommandBufferMask;
+    var endCorrected = end & gfxCommandBufferMask;
+    do {
+        //Read a command:
+        dispatchCommand(gfxCommandBuffer[startCorrected | 0] | 0, gfxCommandBuffer[startCorrected | 1] | 0);
+        //Increment by two since we're reading the command code and corresponding data after it:
+        startCorrected = ((startCorrected | 0) + 2) & gfxCommandBufferMask;
+    } while ((startCorrected | 0) != (endCorrected | 0));
+    //Update the starting position counter to match the end position:
+    Atomics.store(gfxCommandCounters, 0, end | 0);
+}
+function dispatchCommand(command, data) {
+    command = command | 0;
+    data = data | 0;
+    /*
+        We squeeze some address bits as a portion of the command code.
+        The top bits will be the actual command, the bottom ones will be the address,
+        unless of course the top bits are zero, for which then it's purely a command code:
+    */
+    switch (command >> 16) {
+        //IO:
+        case 0:
+            dispatchIOCommand(command | 0, data | 0);
+            break;
+        //VRAM 16-BIT:
+        case 1:
+            renderer.writeVRAM16(command & 0xFFFF, data | 0);
+            break;
+        //VRAM 32-BIT:
+        case 2:
+            renderer.writeVRAM32(command & 0x7FFF, data | 0);
+            break;
+        //Palette 16-BIT:
+        case 3:
+            renderer.writePalette16(command & 0x1FF, data | 0);
+            break;
+        //Palette 32-BIT:
+        case 4:
+            renderer.writePalette32(command & 0xFF, data | 0);
+            break;
+        //OAM 16-BIT:
+        case 5:
+            renderer.writeOAM16(command & 0x1FF, data | 0);
+            break;
+        //OAM 32-BIT:
+        default:
+            renderer.writeOAM32(command & 0xFF, data | 0);
+    }
+}
+function dispatchIOCommand(command, data) {
+    command = command | 0;
+    data = data | 0;
+    switch (command | 0) {
+        case 0:
+            decodeInternalCommand(data | 0);
+            break;
+        case 1:
+            renderer.writeDISPCNT8_0(data | 0);
             break;
         case 2:
-            Iodine.restart();
+            renderer.writeDISPCNT8_1(data | 0);
             break;
         case 3:
-            Iodine.setIntervalRate(+data.payload);
-            changeTimer(data.payload | 0);
+            renderer.writeDISPCNT8_2(data | 0);
             break;
         case 4:
-            Iodine.attachGraphicsFrameHandler(graphicsFrameHandler);
+            renderer.writeDISPCNT16(data | 0);
             break;
         case 5:
-            Iodine.attachAudioHandler(audioHandler);
+            renderer.writeDISPCNT32(data | 0);
             break;
         case 6:
-            Iodine.enableAudio();
+            renderer.writeBG0CNT8_0(data | 0);
             break;
         case 7:
-            Iodine.disableAudio();
+            renderer.writeBG0CNT8_1(data | 0);
             break;
         case 8:
-            Iodine.toggleSkipBootROM(!!data.payload);
+            renderer.writeBG0CNT16(data | 0);
             break;
         case 9:
-            Iodine.toggleDynamicSpeed(!!data.payload);
+            renderer.writeBG1CNT8_0(data | 0);
             break;
         case 10:
-            Iodine.attachSpeedHandler(speedHandler);
+            renderer.writeBG1CNT8_1(data | 0);
             break;
         case 11:
-            Iodine.keyDown(data.payload | 0);
+            renderer.writeBG1CNT16(data | 0);
             break;
         case 12:
-            Iodine.keyUp(data.payload | 0);
+            renderer.writeBG0BG1CNT32(data | 0);
             break;
         case 13:
-            Iodine.incrementSpeed(+data.payload);
+            renderer.writeBG2CNT8_0(data | 0);
             break;
         case 14:
-            Iodine.setSpeed(+data.payload);
+            renderer.writeBG2CNT8_1(data | 0);
             break;
         case 15:
-            Iodine.attachBIOS(data.payload);
+            renderer.writeBG2CNT16(data | 0);
             break;
         case 16:
-            Iodine.attachROM(data.payload);
+            renderer.writeBG3CNT8_0(data | 0);
             break;
         case 17:
-            Iodine.exportSave();
+            renderer.writeBG3CNT8_1(data | 0);
             break;
         case 18:
-            Iodine.attachSaveExportHandler(saveExportHandler);
+            renderer.writeBG3CNT16(data | 0);
             break;
         case 19:
-            Iodine.attachSaveImportHandler(saveImportHandler);
+            renderer.writeBG2BG3CNT32(data | 0);
             break;
         case 20:
-            processSaveImportSuccess(data.payload);
+            renderer.writeBG0HOFS8_0(data | 0);
             break;
         case 21:
-            processSaveImportFail();
+            renderer.writeBG0HOFS8_1(data | 0);
             break;
         case 22:
-            Iodine.toggleOffthreadGraphics(!!data.payload);
+            renderer.writeBG0HOFS16(data | 0);
             break;
         case 23:
-            Iodine.attachPlayStatusHandler(playStatusHandler);
+            renderer.writeBG0VOFS8_0(data | 0);
+            break;
+        case 24:
+            renderer.writeBG0VOFS8_1(data | 0);
+            break;
+        case 25:
+            renderer.writeBG0VOFS16(data | 0);
+            break;
+        case 26:
+            renderer.writeBG0OFS32(data | 0);
+            break;
+        case 27:
+            renderer.writeBG1HOFS8_0(data | 0);
+            break;
+        case 28:
+            renderer.writeBG1HOFS8_1(data | 0);
+            break;
+        case 29:
+            renderer.writeBG1HOFS16(data | 0);
+            break;
+        case 30:
+            renderer.writeBG1VOFS8_0(data | 0);
+            break;
+        case 31:
+            renderer.writeBG1VOFS8_1(data | 0);
+            break;
+        case 32:
+            renderer.writeBG1VOFS16(data | 0);
+            break;
+        case 33:
+            renderer.writeBG1OFS32(data | 0);
+            break;
+        case 34:
+            renderer.writeBG2HOFS8_0(data | 0);
+            break;
+        case 35:
+            renderer.writeBG2HOFS8_1(data | 0);
+            break;
+        case 36:
+            renderer.writeBG2HOFS16(data | 0);
+            break;
+        case 37:
+            renderer.writeBG2VOFS8_0(data | 0);
+            break;
+        case 38:
+            renderer.writeBG2VOFS8_1(data | 0);
+            break;
+        case 39:
+            renderer.writeBG2VOFS16(data | 0);
+            break;
+        case 40:
+            renderer.writeBG2OFS32(data | 0);
+            break;
+        case 41:
+            renderer.writeBG3HOFS8_0(data | 0);
+            break;
+        case 42:
+            renderer.writeBG3HOFS8_1(data | 0);
+            break;
+        case 43:
+            renderer.writeBG3HOFS16(data | 0);
+            break;
+        case 44:
+            renderer.writeBG3VOFS8_0(data | 0);
+            break;
+        case 45:
+            renderer.writeBG3VOFS8_1(data | 0);
+            break;
+        case 46:
+            renderer.writeBG3VOFS16(data | 0);
+            break;
+        case 47:
+            renderer.writeBG3OFS32(data | 0);
+            break;
+        case 48:
+            renderer.writeBG2PA8_0(data | 0);
+            break;
+        case 49:
+            renderer.writeBG2PA8_1(data | 0);
+            break;
+        case 50:
+            renderer.writeBG2PA16(data | 0);
+            break;
+        case 51:
+            renderer.writeBG2PB8_0(data | 0);
+            break;
+        case 52:
+            renderer.writeBG2PB8_1(data | 0);
+            break;
+        case 53:
+            renderer.writeBG2PB16(data | 0);
+            break;
+        case 54:
+            renderer.writeBG2PAB32(data | 0);
+            break;
+        case 55:
+            renderer.writeBG2PC8_0(data | 0);
+            break;
+        case 56:
+            renderer.writeBG2PC8_1(data | 0);
+            break;
+        case 57:
+            renderer.writeBG2PC16(data | 0);
+            break;
+        case 58:
+            renderer.writeBG2PD8_0(data | 0);
+            break;
+        case 59:
+            renderer.writeBG2PD8_1(data | 0);
+            break;
+        case 60:
+            renderer.writeBG2PD16(data | 0);
+            break;
+        case 61:
+            renderer.writeBG2PCD32(data | 0);
+            break;
+        case 62:
+            renderer.writeBG3PA8_0(data | 0);
+            break;
+        case 63:
+            renderer.writeBG3PA8_1(data | 0);
+            break;
+        case 64:
+            renderer.writeBG3PA16(data | 0);
+            break;
+        case 65:
+            renderer.writeBG3PB8_0(data | 0);
+            break;
+        case 66:
+            renderer.writeBG3PB8_1(data | 0);
+            break;
+        case 67:
+            renderer.writeBG3PB16(data | 0);
+            break;
+        case 68:
+            renderer.writeBG3PAB32(data | 0);
+            break;
+        case 69:
+            renderer.writeBG3PC8_0(data | 0);
+            break;
+        case 70:
+            renderer.writeBG3PC8_1(data | 0);
+            break;
+        case 71:
+            renderer.writeBG3PC16(data | 0);
+            break;
+        case 72:
+            renderer.writeBG3PD8_0(data | 0);
+            break;
+        case 73:
+            renderer.writeBG3PD8_1(data | 0);
+            break;
+        case 74:
+            renderer.writeBG3PD16(data | 0);
+            break;
+        case 75:
+            renderer.writeBG3PCD32(data | 0);
+            break;
+        case 76:
+            renderer.writeBG2X8_0(data | 0);
+            break;
+        case 77:
+            renderer.writeBG2X8_1(data | 0);
+            break;
+        case 78:
+            renderer.writeBG2X8_2(data | 0);
+            break;
+        case 79:
+            renderer.writeBG2X8_3(data | 0);
+            break;
+        case 80:
+            renderer.writeBG2X16_0(data | 0);
+            break;
+        case 81:
+            renderer.writeBG2X16_1(data | 0);
+            break;
+        case 82:
+            renderer.writeBG2X32(data | 0);
+            break;
+        case 83:
+            renderer.writeBG2Y8_0(data | 0);
+            break;
+        case 84:
+            renderer.writeBG2Y8_1(data | 0);
+            break;
+        case 85:
+            renderer.writeBG2Y8_2(data | 0);
+            break;
+        case 86:
+            renderer.writeBG2Y8_3(data | 0);
+            break;
+        case 87:
+            renderer.writeBG2Y16_0(data | 0);
+            break;
+        case 88:
+            renderer.writeBG2Y16_1(data | 0);
+            break;
+        case 89:
+            renderer.writeBG2Y32(data | 0);
+            break;
+        case 90:
+            renderer.writeBG3X8_0(data | 0);
+            break;
+        case 91:
+            renderer.writeBG3X8_1(data | 0);
+            break;
+        case 92:
+            renderer.writeBG3X8_2(data | 0);
+            break;
+        case 93:
+            renderer.writeBG3X8_3(data | 0);
+            break;
+        case 94:
+            renderer.writeBG3X16_0(data | 0);
+            break;
+        case 95:
+            renderer.writeBG3X16_1(data | 0);
+            break;
+        case 96:
+            renderer.writeBG3X32(data | 0);
+            break;
+        case 97:
+            renderer.writeBG3Y8_0(data | 0);
+            break;
+        case 98:
+            renderer.writeBG3Y8_1(data | 0);
+            break;
+        case 99:
+            renderer.writeBG3Y8_2(data | 0);
+            break;
+        case 100:
+            renderer.writeBG3Y8_3(data | 0);
+            break;
+        case 101:
+            renderer.writeBG3Y16_0(data | 0);
+            break;
+        case 102:
+            renderer.writeBG3Y16_1(data | 0);
+            break;
+        case 103:
+            renderer.writeBG3Y32(data | 0);
+            break;
+        case 104:
+            renderer.writeWIN0XCOORDRight8(data | 0);
+            break;
+        case 105:
+            renderer.writeWIN0XCOORDLeft8(data | 0);
+            break;
+        case 106:
+            renderer.writeWIN0XCOORD16(data | 0);
+            break;
+        case 107:
+            renderer.writeWIN1XCOORDRight8(data | 0);
+            break;
+        case 108:
+            renderer.writeWIN1XCOORDLeft8(data | 0);
+            break;
+        case 109:
+            renderer.writeWIN1XCOORD16(data | 0);
+            break;
+        case 110:
+            renderer.writeWINXCOORD32(data | 0);
+            break;
+        case 111:
+            renderer.writeWIN0YCOORDBottom8(data | 0);
+            break;
+        case 112:
+            renderer.writeWIN0YCOORDTop8(data | 0);
+            break;
+        case 113:
+            renderer.writeWIN0YCOORD16(data | 0);
+            break;
+        case 114:
+            renderer.writeWIN1YCOORDBottom8(data | 0);
+            break;
+        case 115:
+            renderer.writeWIN1YCOORDTop8(data | 0);
+            break;
+        case 116:
+            renderer.writeWIN1YCOORD16(data | 0);
+            break;
+        case 117:
+            renderer.writeWINYCOORD32(data | 0);
+            break;
+        case 118:
+            renderer.writeWIN0IN8(data | 0);
+            break;
+        case 119:
+            renderer.writeWIN1IN8(data | 0);
+            break;
+        case 120:
+            renderer.writeWININ16(data | 0);
+            break;
+        case 121:
+            renderer.writeWINOUT8(data | 0);
+            break;
+        case 122:
+            renderer.writeWINOBJIN8(data | 0);
+            break;
+        case 123:
+            renderer.writeWINOUT16(data | 0);
+            break;
+        case 124:
+            renderer.writeWINCONTROL32(data | 0);
+            break;
+        case 125:
+            renderer.writeMOSAIC8_0(data | 0);
+            break;
+        case 126:
+            renderer.writeMOSAIC8_1(data | 0);
+            break;
+        case 127:
+            renderer.writeMOSAIC16(data | 0);
+            break;
+        case 128:
+            renderer.writeBLDCNT8_0(data | 0);
+            break;
+        case 129:
+            renderer.writeBLDCNT8_1(data | 0);
+            break;
+        case 130:
+            renderer.writeBLDCNT16(data | 0);
+            break;
+        case 131:
+            renderer.writeBLDALPHA8_0(data | 0);
+            break;
+        case 132:
+            renderer.writeBLDALPHA8_1(data | 0);
+            break;
+        case 133:
+            renderer.writeBLDALPHA16(data | 0);
+            break;
+        case 134:
+            renderer.writeBLDCNT32(data | 0);
+            break;
+        default:
+            renderer.writeBLDY8(data | 0);
     }
 }
-var graphicsFrameHandler = {
-    //Function only called if graphics is THIS thread:
-    copyBuffer:function (swizzledFrame) {
-        //Push a frame of graphics to the blitter handle:
-        //Load the counter values:
-        var start = gfxCounters[0] | 0;                     //Written by the other thread.
-        var end = gfxCounters[1] | 0;                       //Written by this thread.
-        //Check if buffer is full:
-        if ((end | 0) == (((start | 0) + 2) | 0)) {
-            //Skip copying a frame out:
-            return;
-        }
-        //Copy samples into the ring buffer:
-        //Hardcoded for 2 buffers for a triple buffer effect:
-        gfxBuffers[end & 0x1].set(swizzledFrame);
-        //Increment the ending position counter by 1:
-        //Atomic to commit the counter to memory:
-        Atomics.store(gfxCounters, 1, ((end | 0) + 1) | 0);
-    }
-};
-//Shim for our audio api:
-var audioHandler = {
-    initialize:function (channels, sampleRate, bufferLimit, call1, call2, call3) {
-        //Initialize the audio mixer input:
-        channels = channels | 0;
-        sampleRate = +sampleRate;
-        bufferLimit = bufferLimit | 0;
-        //Generate an audio buffer:
-        audioBufferSize = ((bufferLimit | 0) * (channels | 0)) | 0;
-        audioBufferSizeMask = 1;
-        while ((audioBufferSize | 0) >= (audioBufferSizeMask | 0)) {
-            audioBufferSizeMask = (audioBufferSizeMask << 1) | 1;
-        }
-        audioBufferSize = ((audioBufferSizeMask | 0) + 1) | 0;
-        audioBuffer = getSharedFloat32Array(audioBufferSize | 0);
-        audioCounters = getSharedInt32Array(2);
-        try {
-            postMessage({messageID:1, channels:channels | 0, sampleRate:+sampleRate, bufferLimit:bufferLimit | 0, audioBuffer:audioBuffer, audioCounters:audioCounters}, [audioBuffer.buffer, audioCounters.buffer]); 
-        }
-        catch (e) {
-            postMessage({messageID:1, channels:channels | 0, sampleRate:+sampleRate, bufferLimit:bufferLimit | 0, audioBuffer:audioBuffer, audioCounters:audioCounters});
-        }
-    },
-    push:function (buffer, startPos, endPos) {
-        startPos = startPos | 0;
-        endPos = endPos | 0;
-        //Push audio to the audio mixer input handle:
-        //Load the counter values:
-        var start = audioCounters[0] | 0;                 //Written to by the other thread.
-        var end = audioCounters[1] | 0;                   //Written by this thread.
-        var endCorrected = ((end | 0) & (audioBufferSizeMask | 0)) | 0;
-        var freeBufferSpace = ((end | 0) - (start | 0)) | 0;
-        freeBufferSpace = ((audioBufferSize | 0) - (freeBufferSpace | 0)) | 0;
-        var amountToSend = ((endPos | 0) - (startPos | 0)) | 0;
-        amountToSend = Math.min(amountToSend | 0, freeBufferSpace | 0) | 0;
-        endPos = ((startPos | 0) + (amountToSend | 0)) | 0;
-        //Push audio into buffer:
-        for (; (startPos | 0) < (endPos | 0); startPos = ((startPos | 0) + 1) | 0) {
-            audioBuffer[endCorrected | 0] = +buffer[startPos | 0];
-            endCorrected = ((endCorrected | 0) + 1) | 0;
-            if ((endCorrected | 0) == (audioBufferSize | 0)) {
-                endCorrected = 0;
+function decodeInternalCommand(data) {
+    data = data | 0;
+    switch (data | 0) {
+        case 0:
+            //Check to see if we need to skip rendering to catch up:
+            if ((((gfxLinesCPU | 0) - (gfxLinesGPU | 0)) | 0) < 480) {
+                //Render a scanline:
+                renderer.renderScanLine();
             }
-        }
-        //Update the cross thread buffering count:
-        end = ((end | 0) + (amountToSend | 0)) | 0;
-        //Atomic store to commit writes to memory:
-        Atomics.store(audioCounters, 1, end | 0);
-    },
-    register:function () {
-        //Register into the audio mixer:
-        postMessage({messageID:2});
-    },
-    unregister:function () {
-        //Unregister from audio mixer:
-        postMessage({messageID:3});
-    },
-    setBufferSpace:function (spaceContain) {
-        //Ensure buffering minimum levels for the audio:
-        postMessage({messageID:4, audioBufferContainAmount:spaceContain | 0});
-    },
-    remainingBuffer:function () {
-        //Report the amount of audio samples in-flight:
-        var ringBufferCount = this.remainingBufferShared() | 0;
-        var audioSysCount = audioSamplesRemaining[0] | 0;
-        return ((ringBufferCount | 0) + (audioSysCount | 0)) | 0;
-    },
-    remainingBufferShared:function () {
-        //Reported the sample count left in the shared buffer:
-        var start = audioCounters[0] | 0;
-        var end = audioCounters[1] | 0;
-        var ringBufferCount = ((end | 0) - (start | 0)) | 0;
-        return ringBufferCount | 0;
-    }
-};
-function saveImportHandler(saveID, saveCallback, noSaveCallback) {
-    postMessage({messageID:5, saveID:saveID});
-    saveImportPool.push([saveCallback, noSaveCallback]);
-}
-function saveExportHandler(saveID, saveData) {
-    postMessage({messageID:6, saveID:saveID, saveData:saveData});
-}
-function speedHandler(speed) {
-    postMessage({messageID:7, speed:speed});
-}
-function processSaveImportSuccess(saveData) {
-    saveImportPool.shift()[0](saveData);
-}
-function processSaveImportFail() {
-    saveImportPool.shift()[1]();
-}
-function playStatusHandler(isPlaying) {
-    isPlaying = isPlaying | 0;
-    postMessage({messageID:8, playing:(isPlaying | 0)});
-    if ((isPlaying | 0) == 0) {
-        if (timerHandle) {
-            clearInterval(timerHandle);
-            timerHandle = null;
-        }
-    }
-    else {
-        if (!timerHandle) {
-            initTimer(timerRate | 0);
-        }
-    }
-}
-function changeTimer(rate) {
-    rate = rate | 0;
-    if (timerHandle) {
-        clearInterval(timerHandle);
-        initTimer(rate | 0);
-    }
-    timerRate = rate | 0;
-}
-function initTimer(rate) {
-    rate = rate | 0;
-    if ((rate | 0) > 0) {
-        timerHandle = setInterval(function() {
-            Iodine.timerCallback(timestamp[0] >>> 0);
-        }, rate | 0);
+            else {
+                //Update some internal counters to maintain state:
+                renderer.updateReferenceCounters();
+            }
+            //Clock the scanline counter:
+            renderer.incrementScanLine();
+            //Increment how many scanlines we've received out:
+            gfxLinesGPU = ((gfxLinesGPU | 0) + 1) | 0;
+            break;
+        default:
+            //Check to see if we need to skip rendering to catch up:
+            if ((((gfxLinesCPU | 0) - (gfxLinesGPU | 0)) | 0) < 480) {
+                //Push out a frame of graphics:
+                renderer.prepareFrame();
+            }
     }
 }
